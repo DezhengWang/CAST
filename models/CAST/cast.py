@@ -2,11 +2,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from collections import OrderedDict
-from .sam import StaticAttention
-from einops import repeat
 from einops import rearrange
 
-from .embed import DSW_embedding
+from models.Cast.embed import DSW_embedding
+from models.Cast.static_attn import StaticAttention
+from models.Cast.tools import Transpose
 
 
 class StaticAttentionLayer(nn.MultiheadAttention):
@@ -67,62 +67,43 @@ class Encoder(nn.Module):
 
 
 class TSAEncoder(nn.Module):
-    def __init__(self, embed_dim, seq_length, feature_length, num_heads, dim_feedforward=None, d_values=[None, None], dropout=0.1,
-                 batch_first=True):
+    def __init__(self, embed_dim, seq_length, feature_length, num_heads, dim_feedforward=None, d_values=[None, None],
+                 dropout=0.1, batch_first=True):
         super(TSAEncoder, self).__init__()
 
         if dim_feedforward is None:
             dim_feedforward = [embed_dim * 4, seq_length]
 
-        self.ttn = Encoder(d_model=embed_dim, nhead=num_heads[0], n_size=(seq_length, seq_length),
+        self.tta = Encoder(d_model=embed_dim, nhead=num_heads[0], n_size=(seq_length, seq_length),
                            dim_feedforward=dim_feedforward[0], d_values=d_values[0], dropout=dropout,
                            batch_first=batch_first)
         self.sta = Encoder(d_model=embed_dim, nhead=num_heads[1], n_size=(feature_length, feature_length),
                            dim_feedforward=dim_feedforward[1], d_values=d_values[1], dropout=dropout,
                            batch_first=batch_first)
 
+        self.norm_ttn = nn.Sequential(Transpose(1, 2), nn.BatchNorm1d(embed_dim), Transpose(1, 2))
+        self.norm_sta = nn.Sequential(Transpose(1, 2), nn.BatchNorm1d(embed_dim), Transpose(1, 2))
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, data):
-        output = data
-        data = rearrange(data, 'b f l d -> (b f) l d')
-        data = self.ttn(data)
+        b = data.shape[0]
+        tta_data = rearrange(data, 'b f l d -> (b f) l d')
+        tta_data = self.tta(tta_data)
+        tta_data = self.norm_ttn(tta_data)
+        tta_data = rearrange(tta_data, '(b f) l d -> b f l d', b=b)
 
-        data = rearrange(data, '(b f) l d -> (b l) f d', b=output.shape[0])
-        data = self.sta(data)
+        sta_data = rearrange(data, 'b f l d -> (b l) f d')
+        sta_data = self.sta(sta_data)
+        sta_data = self.norm_sta(sta_data)
+        sta_data = rearrange(sta_data, '(b l) f d -> b f l d', b=b)
 
-        data = rearrange(data, '(b l) f d -> b f l d', b=output.shape[0])
-        output = output + data
+        output = data + sta_data + tta_data
 
         return output
 
-
-class Decoder(nn.Module):
-    def __init__(self, d_model, nhead, seq_length=96, label_length=48, dropout=0.1, dim_feedforward=None, d_values=None,
-                 activation=F.relu, batch_first=True):
-        super(Decoder, self).__init__()
-
-        if dim_feedforward is None:
-            dim_feedforward = d_model * 4
-        self.decoder = nn.TransformerDecoderLayer(d_model=d_model,
-                                                  nhead=nhead,
-                                                  dim_feedforward=dim_feedforward,  #
-                                                  dropout=dropout,
-                                                  activation=activation,
-                                                  batch_first=batch_first
-                                                  )
-        self.decoder.self_attn = StaticAttentionLayer(d_model, nhead, n_size=(label_length, label_length),
-                                                      d_values=d_values, dropout=dropout)
-
-    def forward(self, tgt, memory):
-        batch_size = tgt.shape[0]
-        tgt = rearrange(tgt, 'b f l d -> (b f) l d')
-        memory = rearrange(memory, 'b f l d -> (b f) l d')
-
-        tgt = self.decoder(tgt, memory)
-
-        tgt = rearrange(tgt, '(b f) l d -> b f l d', b=batch_size)
-        return tgt
-
-
+"""
+Transformer + Cross Attention + DSG + Static Attention + Prediction Head + Non-stationary
+"""
 class CAST(nn.Module):
     def __init__(self, args, **factory_kwargs):
         super(CAST, self).__init__()
@@ -145,7 +126,6 @@ class CAST(nn.Module):
         self.en_encoding = DSW_embedding(self.seg_len, self.d_model)
         self.enc_pos_embedding = nn.Parameter(torch.randn(1, self.enc_feature, (self.seq_length // self.seg_len), self.d_model))
         self.pre_norm = nn.LayerNorm(self.d_model)
-        self.dec_pos_embedding = nn.Parameter(torch.randn(1, self.dec_feature, (self.pred_len // self.seg_len), self.d_model))
 
         self.dropout = nn.Dropout(dropout)
 
@@ -163,21 +143,11 @@ class CAST(nn.Module):
         self.en_layers = nn.Sequential(en_layers)
         self.en_ln = nn.LayerNorm(self.d_model)
 
-        de_layers = OrderedDict()
-        for i in range(self.num_de_layers):
-            de_layers[f"decoder_layer_{i}"] = Decoder(
-                d_model=self.d_model,
-                nhead=self.nhead,
-                label_length=(self.pred_len // self.seg_len),  ## self.label_len +
-                seq_length=(self.seq_length // self.seg_len),
-                dropout=dropout,
-                batch_first=True
-            )
-        self.de_layers = nn.Sequential(de_layers)
-        self.de_ln = nn.LayerNorm(self.d_model)
-
         heads_layers = OrderedDict()
-        heads_layers["head"] = nn.Linear(self.d_model, self.seg_len, bias=True)
+
+        heads_layers["flatten"] = nn.Flatten(start_dim=-2)
+        heads_layers["heads"] = nn.Linear((self.seq_length // self.seg_len)*self.d_model, self.pred_len)
+        heads_layers["dropout"] = nn.Dropout(0.)
 
         self.heads = nn.Sequential(heads_layers)
 
@@ -187,6 +157,12 @@ class CAST(nn.Module):
 
     def forward(self, src, x_mark_enc, tgt, x_mark_dec, enc_self_mask=None, dec_self_mask=None, dec_enc_mask=None):
         torch._assert(src.dim() == 3, f"src: Expected (batch_size, seq_length, hidden_dim) got {src.shape}")
+
+        means = src.mean(1, keepdim=True).detach()
+        src = src - means
+        stdev = torch.sqrt(torch.var(src, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        src /= stdev
+
         src = self.en_encoding(src)
         src += self.enc_pos_embedding
         src = self.pre_norm(src)
@@ -195,15 +171,13 @@ class CAST(nn.Module):
             src = encoder(src)
         src = self.en_ln(src)
 
-        tgt = repeat(self.dec_pos_embedding, 'b f l d -> (repeat b) f l d', repeat=src.shape[0])
+        res = self.heads(src)
+        res = rearrange(res, 'b f l -> b l f')
 
-        for decoder in self.de_layers:
-            tgt = decoder(tgt, src)
-        tgt = self.de_ln(tgt)
+        res = res * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
+        res = res + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
 
-        tgt = self.heads(tgt)
-        res = rearrange(tgt, 'b f l seg_len -> b (l seg_len) f')
         if self.output_attention:
-            return res[:, -self.pred_len:, :], None
+            return res, None
         else:
-            return res[:, -self.pred_len:, :]
+            return res
