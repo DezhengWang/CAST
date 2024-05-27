@@ -5,7 +5,7 @@ from collections import OrderedDict
 from einops import rearrange
 
 from models.Cast.embed import DSW_embedding
-from models.Cast.static_attn import StaticAttention
+from models.Cast.sam import StaticAttention
 from models.Cast.tools import Transpose
 
 
